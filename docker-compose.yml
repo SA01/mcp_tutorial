@@ -1,0 +1,33 @@
+services:
+  postgres:
+    build: ./db
+    container_name: mcp_tutorial_pg
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: nyc_taxi
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d nyc_taxi"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+  loader:
+    build: ./loader
+    container_name: mcp_tutorial_loader
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgresql://postgres:postgres@postgres:5432/nyc_taxi
+      PARQUET_DIR: /data/nyc_taxi
+    volumes:
+      - ./data/nyc_taxi:/data/nyc_taxi:ro
+    restart: "no"
+
+volumes:
+  pgdata:
