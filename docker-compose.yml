@@ -1,6 +1,6 @@
 services:
   postgres:
-    build: ./db
+    image: postgres:18.3
     container_name: mcp_tutorial_pg
     environment:
       POSTGRES_USER: postgres
