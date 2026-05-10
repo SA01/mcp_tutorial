@@ -1,5 +1,4 @@
 import logging
-import os
 import sys
 
 import psycopg
@@ -13,17 +12,13 @@ logging.basicConfig(
 )
 logger = logging.getLogger("nyc-taxi")
 
-connection_string = os.environ.get(
-    "DATABASE_URL",
-    "postgresql://postgres:postgres@localhost:5432/nyc_taxi",
-)
+connection_string = "postgresql://postgres:postgres@localhost:5432/nyc_taxi"
 
 mcp = FastMCP("nyc-taxi")
 
 
 @mcp.tool()
 def run_sql(sql_query: str) -> dict:
-    """Run a SQL query against the NYC taxi database and return rows."""
     logger.info("query passed: %s", sql_query)
     with psycopg.connect(connection_string) as conn, conn.cursor() as cur:
         cur.execute(sql_query)
