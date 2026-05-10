@@ -3,6 +3,7 @@ name = "mcp-tutorial"
 version = "0.1.0"
 requires-python = ">=3.12"
 dependencies = [
+    "mcp[cli]>=1.2",
     "psycopg[binary]>=3.3.4",
     "pyarrow>=24.0.0",
 ]
