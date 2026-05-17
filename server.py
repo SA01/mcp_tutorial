@@ -2,7 +2,7 @@ import psycopg
 
 from mcp.server.fastmcp import FastMCP
 
-connection_string = "postgresql://postgres:postgres@localhost:5432/nyc_taxi"
+connection_string = "postgresql://mcp_reader:mcp_reader@localhost:5432/nyc_taxi"
 
 mcp = FastMCP("NYC Taxi Trips")
 
