@@ -1,5 +1,5 @@
 from datetime import date
-from typing import Annotated
+from typing import Annotated, Any
 
 import psycopg
 from pydantic import Field
@@ -146,6 +146,350 @@ def trip_spike_detection(
             }
             for d, trips, baseline, pct in cur.fetchall()
         ]
+
+
+COLUMN_ALIASES: dict[str, str] = {
+    "vendor":                "vendor_id",
+    "pickup_datetime":       "tpep_pickup_datetime",
+    "dropoff_datetime":      "tpep_dropoff_datetime",
+    "passengers":            "passenger_count",
+    "distance":              "trip_distance",
+    "ratecode":              "ratecode_id",
+    "store_and_fwd_flag":    "store_and_fwd_flag",
+    "pickup_zone":           "pu_location_id",
+    "dropoff_zone":          "do_location_id",
+    "payment_type":          "payment_type",
+    "fare":                  "fare_amount",
+    "extra":                 "extra",
+    "mta_tax":               "mta_tax",
+    "tip":                   "tip_amount",
+    "tolls":                 "tolls_amount",
+    "improvement_surcharge": "improvement_surcharge",
+    "total":                 "total_amount",
+    "congestion_surcharge":  "congestion_surcharge",
+    "airport_fee":           "airport_fee",
+    "cbd_congestion_fee":    "cbd_congestion_fee",
+}
+
+ALLOWED_AGGREGATES: set[str] = {"count", "sum", "avg", "min", "max"}
+ALLOWED_ORDER_DIRECTIONS: set[str] = {"asc", "desc"}
+
+MAX_ROWS = 1000
+
+
+_ALLOWED_COLUMN_NAMES = sorted(COLUMN_ALIASES.keys())
+
+
+def _validate_columns(label: str, names: list[str]) -> None:
+    bad = [c for c in names if c not in COLUMN_ALIASES]
+    if bad:
+        raise ValueError(
+            f"{label} contains unknown column(s): {bad}. Allowed: {_ALLOWED_COLUMN_NAMES}"
+        )
+
+
+def _validate_select_and_group(select: list[str], group_by: list[str] | None) -> None:
+    _validate_columns("select", select)
+    if group_by is None:
+        return
+    _validate_columns("group_by", group_by)
+    not_grouped = [c for c in select if c not in group_by]
+    if not_grouped:
+        raise ValueError(
+            f"select columns must also appear in group_by when grouping: {not_grouped}"
+        )
+
+
+def _validate_aggregate(
+    aggregate: dict[str, str] | None, group_by: list[str] | None
+) -> None:
+    if aggregate is None:
+        return
+    if not group_by:
+        raise ValueError("`aggregate` requires `group_by` to be set.")
+    _validate_columns("aggregate", list(aggregate.keys()))
+    bad_funcs = [f for f in aggregate.values() if f not in ALLOWED_AGGREGATES]
+    if bad_funcs:
+        raise ValueError(
+            f"aggregate function(s) not allowed: {bad_funcs}. "
+            f"Allowed: {sorted(ALLOWED_AGGREGATES)}"
+        )
+
+
+def _validate_filters(filters: dict[str, list[Any]] | None) -> None:
+    if filters is None:
+        return
+    _validate_columns("filters", list(filters.keys()))
+    empty = [c for c, v in filters.items() if not v]
+    if empty:
+        raise ValueError(f"filters value lists must be non-empty: {empty}")
+
+
+def _validate_range_filters(
+    range_filters: dict[str, dict[str, Any]] | None,
+) -> None:
+    if range_filters is None:
+        return
+    _validate_columns("range_filters", list(range_filters.keys()))
+    for col, bounds in range_filters.items():
+        if not isinstance(bounds, dict):
+            raise ValueError(
+                f"range_filters['{col}'] must be a dict with 'low' and 'high' keys."
+            )
+        extra = set(bounds) - {"low", "high"}
+        if extra:
+            raise ValueError(
+                f"range_filters['{col}'] has unexpected key(s) {sorted(extra)}; "
+                f"expected exactly 'low' and 'high'."
+            )
+        if "low" not in bounds or "high" not in bounds:
+            raise ValueError(
+                f"range_filters['{col}'] must provide both 'low' and 'high'."
+            )
+
+
+def _sortable_names(
+    select: list[str],
+    group_by: list[str] | None,
+    aggregate: dict[str, str] | None,
+) -> set[str]:
+    """Names that may appear in `order_by` — anything visible in the result row."""
+    aggregate_aliases = {f"{func}_{col}" for col, func in (aggregate or {}).items()}
+    return set(select) | set(group_by or ()) | aggregate_aliases
+
+
+def _validate_order_by(
+    order_by: dict[str, str] | None, sortable: set[str]
+) -> None:
+    if order_by is None:
+        return
+    bad = [c for c in order_by if c not in sortable]
+    if bad:
+        raise ValueError(
+            f"order_by references column(s) that are not selected, grouped, or "
+            f"aggregated: {bad}. Sortable in this query: {sorted(sortable)}"
+        )
+    bad_dirs = [d for d in order_by.values() if d.lower() not in ALLOWED_ORDER_DIRECTIONS]
+    if bad_dirs:
+        raise ValueError(
+            f"order_by directions must be 'asc' or 'desc', got: {bad_dirs}"
+        )
+
+
+def _build_select_clause(
+    select: list[str], aggregate: dict[str, str] | None
+) -> tuple[str, list[str]]:
+    """Return the SELECT-list SQL and the list of result-row keys it produces."""
+    terms = [f"{COLUMN_ALIASES[c]} AS {c}" for c in select]
+    output_keys = list(select)
+    for col, func in (aggregate or {}).items():
+        alias = f"{func}_{col}"
+        terms.append(f"{func}({COLUMN_ALIASES[col]}) AS {alias}")
+        output_keys.append(alias)
+    return ", ".join(terms), output_keys
+
+
+def _build_where_clause(
+    filters: dict[str, list[Any]] | None,
+    range_filters: dict[str, dict[str, Any]] | None,
+) -> tuple[str, list[Any]]:
+    clauses: list[str] = []
+    params: list[Any] = []
+
+    for col, values in (filters or {}).items():
+        placeholders = ", ".join(["%s"] * len(values))
+        clauses.append(f"{COLUMN_ALIASES[col]} IN ({placeholders})")
+        params.extend(values)
+
+    # Half-open [low, high): low is inclusive, high is exclusive. Lets callers
+    # say "July 2025" as low=2025-07-01, high=2025-08-01 without picking up
+    # midnight on Aug 1.
+    for col, bounds in (range_filters or {}).items():
+        internal = COLUMN_ALIASES[col]
+        clauses.append(f"{internal} >= %s AND {internal} < %s")
+        params.append(bounds["low"])
+        params.append(bounds["high"])
+
+    if not clauses:
+        return "", []
+    return "WHERE " + " AND ".join(clauses), params
+
+
+def _build_group_by_clause(group_by: list[str] | None) -> str:
+    if not group_by:
+        return ""
+    return "GROUP BY " + ", ".join(COLUMN_ALIASES[c] for c in group_by)
+
+
+def _build_order_by_clause(order_by: dict[str, str] | None) -> str:
+    # `order_by` keys are validated as either a public column name (handled by the
+    # `<internal> AS <public>` alias in SELECT) or an aggregate alias (also in SELECT).
+    # Either way, sorting by the public name resolves correctly in Postgres.
+    if not order_by:
+        return ""
+    return "ORDER BY " + ", ".join(f"{c} {d.upper()}" for c, d in order_by.items())
+
+
+def _build_sql(
+    select: list[str],
+    group_by: list[str] | None,
+    aggregate: dict[str, str] | None,
+    filters: dict[str, list[Any]] | None,
+    range_filters: dict[str, dict[str, Any]] | None,
+    order_by: dict[str, str] | None,
+    limit: int,
+) -> tuple[str, list[Any], list[str]]:
+    """Assemble the SQL string, bind parameters, and result-row keys."""
+    select_sql, output_keys = _build_select_clause(select, aggregate)
+    where_sql, where_params = _build_where_clause(filters, range_filters)
+
+    parts = [
+        f"SELECT {select_sql}",
+        "FROM yellow_tripdata",
+        where_sql,
+        _build_group_by_clause(group_by),
+        _build_order_by_clause(order_by),
+        "LIMIT %s",
+    ]
+    sql = "\n".join(p for p in parts if p)
+    params = [*where_params, limit]
+    return sql, params, output_keys
+
+
+def _run_query(sql: str, params: list[Any], output_keys: list[str]) -> list[dict]:
+    with psycopg.connect(connection_string) as conn, conn.cursor() as cur:
+        cur.execute(sql, params)
+        return [dict(zip(output_keys, row)) for row in cur.fetchall()]
+
+
+@mcp.tool()
+def query_trips(
+    select: Annotated[
+        list[str],
+        Field(
+            description=(
+                "Columns to return as-is (no aggregation). Must be a subset of the allowed column "
+                "names listed below. When `group_by` is given, every entry in `select` must also "
+                "appear in `group_by` — SQL would otherwise reject the column as not grouped. Pass "
+                "an empty list if you only want aggregates.\n\n"
+                f"Allowed column names: {_ALLOWED_COLUMN_NAMES}"
+            ),
+        ),
+    ],
+    group_by: Annotated[
+        list[str] | None,
+        Field(
+            description=(
+                "Columns to GROUP BY. Optional. Required when `aggregate` is given. Every entry "
+                "must be one of the allowed column names."
+            ),
+        ),
+    ] = None,
+    aggregate: Annotated[
+        dict[str, str] | None,
+        Field(
+            description=(
+                "Aggregations to compute, as a mapping {column: function}. The function must be one "
+                "of: count, sum, avg, min, max. `count` accepts any column (including non-numeric); "
+                "the others require a numeric column. Result keys are '<func>_<column>' (e.g. "
+                "{'fare': 'avg'} -> 'avg_fare'). Requires `group_by` to be set."
+            ),
+        ),
+    ] = None,
+    filters: Annotated[
+        dict[str, list[Any]] | None,
+        Field(
+            description=(
+                "Equality (IN) filters, as {column: [value, ...]}. A row matches when the column "
+                "equals one of the listed values; multiple columns are combined with AND. Use this "
+                "for discrete-value columns (payment_type, pickup_zone, vendor, ...). "
+                "DO NOT use this for date or timestamp ranges — listing two dates here means "
+                "'exactly these two instants', not 'between them'. Use `range_filters` instead."
+            ),
+        ),
+    ] = None,
+    range_filters: Annotated[
+        dict[str, dict[str, Any]] | None,
+        Field(
+            description=(
+                "Half-open range filters, as {column: {'low': L, 'high': H}}. A row matches when "
+                "`L <= column < H` (low inclusive, high exclusive). Multiple columns are combined "
+                "with AND, and may be combined with `filters` on other columns. "
+                "Designed for date/timestamp and numeric ranges — e.g. all of July 2025 is "
+                "{'pickup_datetime': {'low': '2025-07-01', 'high': '2025-08-01'}}. Values are "
+                "passed as bind parameters; types must match the underlying column."
+            ),
+        ),
+    ] = None,
+    order_by: Annotated[
+        dict[str, str] | None,
+        Field(
+            description=(
+                "Sort order, as {column_or_alias: 'asc'|'desc'}. Each key must be either (a) a "
+                "column listed in `select` / `group_by`, or (b) an aggregate output name of the "
+                "form '<func>_<column>' that matches an entry in `aggregate`. Sorting by a column "
+                "that wasn't selected or grouped is rejected. Insertion order of the dict defines "
+                "sort priority."
+            ),
+        ),
+    ] = None,
+    limit: Annotated[
+        int,
+        Field(
+            description=(
+                f"Maximum number of rows to return. Capped at {MAX_ROWS}. Applies after grouping."
+            ),
+            gt=0,
+            le=MAX_ROWS,
+        ),
+    ] = 100,
+) -> list[dict]:
+    """Generic, validated query against the yellow-taxi trips dataset.
+
+    A constrained alternative to a raw-SQL tool: callers describe *what* they want
+    (columns, grouping, aggregates, equality filters, sort order) and the server
+    assembles a parameterized SQL statement. Only an allow-listed set of column
+    names and aggregate functions are accepted; everything else is rejected before
+    any SQL runs.
+
+    All column names in arguments and result keys use the public alias names, not
+    the underlying database column names.
+
+    Shape:
+      - `select` lists plain columns to return.
+      - `group_by` + `aggregate` together produce a GROUP BY query. If `aggregate`
+        is set, `group_by` must also be set, and every `select` column must appear
+        in `group_by`.
+      - `filters` is a dict of equality-in-set predicates (SQL `IN`), joined with
+        AND across keys: `{"pickup_zone": [132, 138], "payment_type": [1]}` becomes
+        `pickup_zone IN (132, 138) AND payment_type IN (1)`. Use for discrete values
+        only; for date/timestamp/numeric ranges use `range_filters`.
+      - `range_filters` is a dict of half-open ranges, joined with AND with each
+        other and with `filters`: `{"pickup_datetime": {"low": "2025-07-01",
+        "high": "2025-08-01"}}` becomes `tpep_pickup_datetime >= '2025-07-01' AND
+        tpep_pickup_datetime < '2025-08-01'`.
+      - `order_by` sorts the result. Keys must be either a selected/grouped
+        column name or an aggregate output alias (e.g. `avg_fare`).
+      - `limit` caps the result row count.
+
+    Returns a list of {column_or_alias: value} dicts. Aggregate columns are named
+    `<func>_<column>` using the public column alias (e.g. `avg_fare`,
+    `count_pickup_zone`). Use `data_date_range` first if you need to know the
+    available date span before constructing filters.
+    """
+    if not select and not aggregate:
+        raise ValueError("Provide at least one of `select` or `aggregate`.")
+
+    _validate_select_and_group(select, group_by)
+    _validate_aggregate(aggregate, group_by)
+    _validate_filters(filters)
+    _validate_range_filters(range_filters)
+    _validate_order_by(order_by, _sortable_names(select, group_by, aggregate))
+
+    sql, params, output_keys = _build_sql(
+        select, group_by, aggregate, filters, range_filters, order_by, limit
+    )
+    return _run_query(sql, params, output_keys)
 
 
 if __name__ == '__main__':
