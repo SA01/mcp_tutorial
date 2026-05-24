@@ -1,4 +1,7 @@
+import csv
+import json
 from datetime import date
+from pathlib import Path
 from typing import Annotated, Any
 
 import psycopg
@@ -10,13 +13,13 @@ connection_string = "postgresql://mcp_reader:mcp_reader@localhost:5432/nyc_taxi"
 
 mcp = FastMCP("NYC Taxi Trips")
 
-@mcp.tool()
-def data_date_range() -> dict:
+def _query_date_range() -> dict:
     """Earliest and latest trip pickup dates available in the dataset.
 
-    Use this first to discover the bounds of the data before calling tools that take
-    start_date / end_date arguments. Returns {start_date, end_date} as ISO 8601 date strings.
-    Returns nulls for both fields if the table is empty.
+    Lives as a plain function (used by the taxi://date_range resource and by
+    samplers that need to bound their example queries). Not registered as a
+    tool — discovering data bounds is context, not an action the model needs
+    to plan around.
     """
     sql = """
         SELECT min(tpep_pickup_datetime)::date AS start_date,
@@ -489,6 +492,262 @@ def query_trips(
         select, group_by, aggregate, filters, range_filters, order_by, limit
     )
     return _run_query(sql, params, output_keys)
+
+
+# ---------------------------------------------------------------------------
+# Resources
+#
+# Tools are model-invoked: the LLM decides when to call them. Resources are
+# client-pulled: the client (or user, via the client UI) fetches them by URI
+# and feeds the content to the model as context. They're the right primitive
+# for stable reference material the model benefits from seeing but shouldn't
+# have to discover by calling a tool — schemas, lookup tables, examples.
+#
+# We expose four:
+#   taxi://schema           — the tool surface as JSON (static)
+#   taxi://zones            — the TLC zone_id → name lookup (static)
+#   taxi://date_range       — earliest/latest pickup dates in the dataset (dynamic)
+#   taxi://samples/{tool}   — a live sample of each tool's output (dynamic)
+#
+# Note that taxi://date_range used to be a tool (data_date_range). It moved to
+# being a resource because discovering data bounds is context the model needs
+# before constructing a query — it shouldn't be an action the model has to
+# remember to take. The line between tools and resources is less about what
+# the code does and more about who decides when to invoke it: tools are
+# model-chosen, resources are client-attached.
+#
+# All three return application/json; the same content could just as well be
+# served as text/markdown if the audience were human-first rather than
+# model-first.
+# ---------------------------------------------------------------------------
+
+
+_SCHEMA: dict[str, Any] = {
+    "trips_per_month": {
+        "description": "Trip counts grouped by calendar month over a month range.",
+        "inputs": {
+            "start_month": "string, 'YYYY-MM', inclusive",
+            "end_month": "string, 'YYYY-MM', inclusive",
+        },
+        "output": {
+            "shape": "array of objects",
+            "fields": {"month": "'YYYY-MM'", "trips": "integer"},
+        },
+    },
+    "top_pickup_zones": {
+        "description": "Top pickup zones by trip count over a date range.",
+        "inputs": {
+            "start_date": "ISO 8601 date, inclusive",
+            "end_date": "ISO 8601 date, exclusive",
+            "limit": "integer > 0",
+        },
+        "output": {
+            "shape": "array of objects",
+            "fields": {
+                "zone_id": "TLC zone id (integer); resolve via taxi://zones",
+                "trips": "integer",
+            },
+        },
+    },
+    "trip_spike_detection": {
+        "description": "Days whose trip count exceeds a rolling baseline by more than a given percent.",
+        "inputs": {
+            "start_date": "ISO 8601 date, inclusive",
+            "end_date": "ISO 8601 date, inclusive",
+            "threshold_pct": "float; percent above baseline that qualifies as a spike",
+            "baseline_window_days": "integer; rolling window size",
+        },
+        "output": {
+            "shape": "array of objects",
+            "fields": {
+                "day": "ISO 8601 date",
+                "trips": "integer",
+                "baseline": "float",
+                "pct_above_baseline": "float",
+            },
+        },
+    },
+    "query_trips": {
+        "description": (
+            "Generic, validated query against yellow_tripdata. Callers describe what they "
+            "want; the server assembles a parameterized SQL statement."
+        ),
+        "inputs": {
+            "select": "list[str]; allowed column names only",
+            "group_by": "list[str] | null; required when aggregate is set",
+            "aggregate": "{column: function} | null; function in {count, sum, avg, min, max}",
+            "filters": "{column: [values]} | null; IN-set equality, ANDed across keys",
+            "range_filters": "{column: {low, high}} | null; half-open [low, high)",
+            "order_by": "{column_or_alias: 'asc'|'desc'} | null",
+            "limit": f"integer, 1..{MAX_ROWS}",
+        },
+        "output": {
+            "shape": "array of objects",
+            "fields": (
+                "keys match `select` entries; aggregate columns are named '<func>_<column>' "
+                "(e.g. avg_fare)"
+            ),
+        },
+        "allowed_columns": _ALLOWED_COLUMN_NAMES,
+        "allowed_aggregates": sorted(ALLOWED_AGGREGATES),
+    },
+}
+
+
+@mcp.resource(
+    "taxi://schema",
+    name="schema",
+    description="Tool surface as JSON: inputs, outputs, allow-listed columns and aggregates.",
+    mime_type="application/json",
+)
+def schema_resource() -> str:
+    return json.dumps(_SCHEMA, indent=2)
+
+
+_ZONES_CSV = Path(__file__).parent / "data" / "taxi_zone_lookup.csv"
+
+
+def _load_zones() -> list[dict]:
+    with _ZONES_CSV.open(newline="") as f:
+        reader = csv.DictReader(f)
+        return [
+            {
+                "location_id": int(row["LocationID"]),
+                "borough": row["Borough"],
+                "zone": row["Zone"],
+                "service_zone": row["service_zone"],
+            }
+            for row in reader
+        ]
+
+
+_ZONES: list[dict] = _load_zones()
+
+
+@mcp.resource(
+    "taxi://zones",
+    name="zones",
+    description="TLC taxi-zone lookup: location_id → borough, zone, service_zone.",
+    mime_type="application/json",
+)
+def zones_resource() -> str:
+    return json.dumps(_ZONES, indent=2)
+
+
+@mcp.resource(
+    "taxi://date_range",
+    name="date_range",
+    description="Earliest and latest pickup dates available in the dataset.",
+    mime_type="application/json",
+)
+def date_range_resource() -> str:
+    return json.dumps(_query_date_range(), indent=2)
+
+
+# Sample resource template. Each branch runs a real query against the live DB
+# so the returned shape reflects current data. Kept small (10 rows) so the
+# response stays cheap to fetch — these are illustrative, not analytical.
+
+def _sample_trips_per_month() -> Any:
+    bounds = _query_date_range()
+    end = bounds["end_date"]
+    if end is None:
+        return []
+    end_month = end[:7]
+    # ten months ending at the latest available month
+    year, month = int(end_month[:4]), int(end_month[5:7])
+    start_month_idx = (year * 12 + (month - 1)) - 9
+    sy, sm = divmod(start_month_idx, 12)
+    start_month = f"{sy:04d}-{sm + 1:02d}"
+    return trips_per_month(start_month=start_month, end_month=end_month)
+
+
+def _sample_top_pickup_zones() -> Any:
+    bounds = _query_date_range()
+    if bounds["end_date"] is None:
+        return []
+    end_date = date.fromisoformat(bounds["end_date"])
+    start_date = date(end_date.year, end_date.month, 1)
+    return top_pickup_zones(start_date=start_date, end_date=end_date, limit=10)
+
+
+def _sample_trip_spike_detection() -> Any:
+    bounds = _query_date_range()
+    if bounds["end_date"] is None:
+        return []
+    end_date = date.fromisoformat(bounds["end_date"])
+    start_date = date(end_date.year, end_date.month, 1)
+    return trip_spike_detection(
+        start_date=start_date,
+        end_date=end_date,
+        threshold_pct=10.0,
+        baseline_window_days=7,
+    )
+
+
+def _sample_query_trips() -> Any:
+    """A few representative shapes — not exhaustive."""
+    bounds = _query_date_range()
+    if bounds["end_date"] is None:
+        return {}
+    end_date = date.fromisoformat(bounds["end_date"])
+    month_start = date(end_date.year, end_date.month, 1)
+    month_str = month_start.isoformat()
+    end_str = end_date.isoformat()
+
+    plain_select = query_trips(
+        select=["pickup_zone", "fare", "tip"],
+        range_filters={"pickup_datetime": {"low": month_str, "high": end_str}},
+        limit=10,
+    )
+    grouped_aggregate = query_trips(
+        select=["payment_type"],
+        group_by=["payment_type"],
+        aggregate={"fare": "avg", "tip": "avg"},
+        range_filters={"pickup_datetime": {"low": month_str, "high": end_str}},
+        order_by={"avg_fare": "desc"},
+        limit=10,
+    )
+    top_zones_by_avg_fare = query_trips(
+        select=["pickup_zone"],
+        group_by=["pickup_zone"],
+        aggregate={"fare": "avg", "pickup_zone": "count"},
+        range_filters={"pickup_datetime": {"low": month_str, "high": end_str}},
+        order_by={"avg_fare": "desc"},
+        limit=10,
+    )
+    return {
+        "plain_select": plain_select,
+        "grouped_aggregate": grouped_aggregate,
+        "top_zones_by_avg_fare": top_zones_by_avg_fare,
+    }
+
+
+_SAMPLERS = {
+    "trips_per_month": _sample_trips_per_month,
+    "top_pickup_zones": _sample_top_pickup_zones,
+    "trip_spike_detection": _sample_trip_spike_detection,
+    "query_trips": _sample_query_trips,
+}
+
+
+@mcp.resource(
+    "taxi://samples/{tool}",
+    name="samples",
+    description=(
+        "Live sample output for a given tool. Path values: "
+        "trips_per_month, top_pickup_zones, trip_spike_detection, query_trips."
+    ),
+    mime_type="application/json",
+)
+def samples_resource(tool: str) -> str:
+    sampler = _SAMPLERS.get(tool)
+    if sampler is None:
+        raise ValueError(
+            f"Unknown tool '{tool}'. Available: {sorted(_SAMPLERS)}"
+        )
+    result = sampler()
+    return json.dumps(result, indent=2, default=str)
 
 
 if __name__ == '__main__':
