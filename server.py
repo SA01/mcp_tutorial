@@ -13,28 +13,6 @@ connection_string = "postgresql://mcp_reader:mcp_reader@localhost:5432/nyc_taxi"
 
 mcp = FastMCP("NYC Taxi Trips")
 
-def _query_date_range() -> dict:
-    """Earliest and latest trip pickup dates available in the dataset.
-
-    Lives as a plain function (used by the taxi://date_range resource and by
-    samplers that need to bound their example queries). Not registered as a
-    tool — discovering data bounds is context, not an action the model needs
-    to plan around.
-    """
-    sql = """
-        SELECT min(tpep_pickup_datetime)::date AS start_date,
-               max(tpep_pickup_datetime)::date AS end_date
-        FROM yellow_tripdata
-    """
-    with psycopg.connect(connection_string) as conn, conn.cursor() as cur:
-        cur.execute(sql)
-        start, end = cur.fetchone()
-        return {
-            "start_date": start.isoformat() if start else None,
-            "end_date": end.isoformat() if end else None,
-        }
-
-
 @mcp.tool()
 def trips_per_month(
     start_month: Annotated[str, Field(description="First month to include, inclusive, as 'YYYY-MM' (e.g. '2024-01').", pattern=r"^\d{4}-(0[1-9]|1[0-2])$")],
@@ -497,28 +475,10 @@ def query_trips(
 # ---------------------------------------------------------------------------
 # Resources
 #
-# Tools are model-invoked: the LLM decides when to call them. Resources are
-# client-pulled: the client (or user, via the client UI) fetches them by URI
-# and feeds the content to the model as context. They're the right primitive
-# for stable reference material the model benefits from seeing but shouldn't
-# have to discover by calling a tool — schemas, lookup tables, examples.
-#
-# We expose four:
 #   taxi://schema           — the tool surface as JSON (static)
 #   taxi://zones            — the TLC zone_id → name lookup (static)
 #   taxi://date_range       — earliest/latest pickup dates in the dataset (dynamic)
 #   taxi://samples/{tool}   — a live sample of each tool's output (dynamic)
-#
-# Note that taxi://date_range used to be a tool (data_date_range). It moved to
-# being a resource because discovering data bounds is context the model needs
-# before constructing a query — it shouldn't be an action the model has to
-# remember to take. The line between tools and resources is less about what
-# the code does and more about who decides when to invoke it: tools are
-# model-chosen, resources are client-attached.
-#
-# All three return application/json; the same content could just as well be
-# served as text/markdown if the audience were human-first rather than
-# model-first.
 # ---------------------------------------------------------------------------
 
 
@@ -632,6 +592,22 @@ _ZONES: list[dict] = _load_zones()
 )
 def zones_resource() -> str:
     return json.dumps(_ZONES, indent=2)
+
+
+def _query_date_range() -> dict:
+    """Earliest and latest trip pickup dates available in the dataset."""
+    sql = """
+        SELECT min(tpep_pickup_datetime)::date AS start_date,
+               max(tpep_pickup_datetime)::date AS end_date
+        FROM yellow_tripdata
+    """
+    with psycopg.connect(connection_string) as conn, conn.cursor() as cur:
+        cur.execute(sql)
+        start, end = cur.fetchone()
+        return {
+            "start_date": start.isoformat() if start else None,
+            "end_date": end.isoformat() if end else None,
+        }
 
 
 @mcp.resource(
