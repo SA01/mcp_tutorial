@@ -66,7 +66,6 @@ def top_pickup_zones(
 
     Returns up to `limit` rows of {zone_id, trips}, ordered by trips descending.
     zone_id is the NYC TLC taxi-zone identifier (integer) — not a human-readable name.
-    A zone-to-name mapping is not loaded in this tutorial; callers should treat zone_id as opaque.
     """
     sql = """
         SELECT pu_location_id AS zone_id,
