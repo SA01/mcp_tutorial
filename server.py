@@ -13,7 +13,7 @@ connection_string = "postgresql://mcp_reader:mcp_reader@localhost:5432/nyc_taxi"
 
 mcp = FastMCP("NYC Taxi Trips")
 
-@mcp.tool()
+# @mcp.tool()  # temporarily hidden — screenshotting date_range only
 def trips_per_month(
     start_month: Annotated[str, Field(description="First month to include, inclusive, as 'YYYY-MM' (e.g. '2024-01').", pattern=r"^\d{4}-(0[1-9]|1[0-2])$")],
     end_month: Annotated[str, Field(description="Last month to include, inclusive, as 'YYYY-MM' (e.g. '2024-03').", pattern=r"^\d{4}-(0[1-9]|1[0-2])$")],
@@ -37,7 +37,7 @@ def trips_per_month(
         return [{"month": m, "trips": t} for m, t in cur.fetchall()]
 
 
-@mcp.tool()
+# @mcp.tool()  # temporarily hidden — screenshotting date_range only
 def top_pickup_zones(
     start_date: Annotated[date, Field(description="Inclusive lower bound on pickup date (ISO 8601).")],
     end_date: Annotated[date, Field(description="Exclusive upper bound on pickup date.")],
@@ -63,7 +63,7 @@ def top_pickup_zones(
         return [{"zone_id": z, "trips": t} for z, t in cur.fetchall()]
 
 
-@mcp.tool()
+# @mcp.tool()  # temporarily hidden — screenshotting date_range only
 def trip_spike_detection(
     start_date: Annotated[date, Field(description="First day to evaluate for spikes (inclusive, ISO 8601).")],
     end_date: Annotated[date, Field(description="Last day to evaluate for spikes (inclusive, ISO 8601).")],
@@ -342,7 +342,7 @@ def _run_query(sql: str, params: list[Any], output_keys: list[str]) -> list[dict
         return [dict(zip(output_keys, row)) for row in cur.fetchall()]
 
 
-@mcp.tool()
+# @mcp.tool()  # temporarily hidden — screenshotting date_range only
 def query_trips(
     select: Annotated[
         list[str],
@@ -475,10 +475,10 @@ def query_trips(
 # ---------------------------------------------------------------------------
 # Resources
 #
-#   taxi://schema           — the tool surface as JSON (static)
-#   taxi://zones            — the TLC zone_id → name lookup (static)
-#   taxi://date_range       — earliest/latest pickup dates in the dataset (dynamic)
-#   taxi://samples/{tool}   — a live sample of each tool's output (dynamic)
+#   taxitrips://schema            — the tool surface as JSON (static)
+#   taxitrips://zones             — the TLC zone_id → name lookup (static)
+#   taxitrips://date-range        — earliest/latest pickup dates in the dataset (dynamic)
+#   taxitrips://samples/{tool}    — a live sample of each tool's output (dynamic)
 # ---------------------------------------------------------------------------
 
 
@@ -504,7 +504,7 @@ _SCHEMA: dict[str, Any] = {
         "output": {
             "shape": "array of objects",
             "fields": {
-                "zone_id": "TLC zone id (integer); resolve via taxi://zones",
+                "zone_id": "TLC zone id (integer); resolve via taxitrips://zones",
                 "trips": "integer",
             },
         },
@@ -555,7 +555,7 @@ _SCHEMA: dict[str, Any] = {
 
 
 @mcp.resource(
-    "taxi://schema",
+    "taxitrips://schema",
     name="schema",
     description="Tool surface as JSON: inputs, outputs, allow-listed columns and aggregates.",
     mime_type="application/json",
@@ -581,17 +581,14 @@ def _load_zones() -> list[dict]:
         ]
 
 
-_ZONES: list[dict] = _load_zones()
-
-
 @mcp.resource(
-    "taxi://zones",
-    name="zones",
-    description="TLC taxi-zone lookup: location_id → borough, zone, service_zone.",
+    "taxitrips://zones",
+    name="zones-lookup",
+    description="TLC taxi-zone lookup: Maps location IDs (pickup and drop off location IDs) to borough, zone, and service_zone.",
     mime_type="application/json",
 )
 def zones_resource() -> str:
-    return json.dumps(_ZONES, indent=2)
+    return json.dumps(_load_zones(), indent=2)
 
 
 def _query_date_range() -> dict:
@@ -611,8 +608,8 @@ def _query_date_range() -> dict:
 
 
 @mcp.resource(
-    "taxi://date_range",
-    name="date_range",
+    "taxitrips://date-range",
+    name="date-range",
     description="Earliest and latest pickup dates available in the dataset.",
     mime_type="application/json",
 )
@@ -708,7 +705,7 @@ _SAMPLERS = {
 
 
 @mcp.resource(
-    "taxi://samples/{tool}",
+    "taxitrips://samples/{tool}",
     name="samples",
     description=(
         "Live sample output for a given tool. Path values: "
