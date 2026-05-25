@@ -13,7 +13,7 @@ connection_string = "postgresql://mcp_reader:mcp_reader@localhost:5432/nyc_taxi"
 
 mcp = FastMCP("NYC Taxi Trips")
 
-# @mcp.tool()  # temporarily hidden — screenshotting date_range only
+@mcp.tool()
 def trips_per_month(
     start_month: Annotated[str, Field(description="First month to include, inclusive, as 'YYYY-MM' (e.g. '2024-01').", pattern=r"^\d{4}-(0[1-9]|1[0-2])$")],
     end_month: Annotated[str, Field(description="Last month to include, inclusive, as 'YYYY-MM' (e.g. '2024-03').", pattern=r"^\d{4}-(0[1-9]|1[0-2])$")],
@@ -37,7 +37,7 @@ def trips_per_month(
         return [{"month": m, "trips": t} for m, t in cur.fetchall()]
 
 
-# @mcp.tool()  # temporarily hidden — screenshotting date_range only
+@mcp.tool()
 def top_pickup_zones(
     start_date: Annotated[date, Field(description="Inclusive lower bound on pickup date (ISO 8601).")],
     end_date: Annotated[date, Field(description="Exclusive upper bound on pickup date.")],
@@ -63,7 +63,7 @@ def top_pickup_zones(
         return [{"zone_id": z, "trips": t} for z, t in cur.fetchall()]
 
 
-# @mcp.tool()  # temporarily hidden — screenshotting date_range only
+@mcp.tool()
 def trip_spike_detection(
     start_date: Annotated[date, Field(description="First day to evaluate for spikes (inclusive, ISO 8601).")],
     end_date: Annotated[date, Field(description="Last day to evaluate for spikes (inclusive, ISO 8601).")],
@@ -342,7 +342,7 @@ def _run_query(sql: str, params: list[Any], output_keys: list[str]) -> list[dict
         return [dict(zip(output_keys, row)) for row in cur.fetchall()]
 
 
-# @mcp.tool()  # temporarily hidden — screenshotting date_range only
+@mcp.tool()
 def query_trips(
     select: Annotated[
         list[str],
@@ -476,9 +476,9 @@ def query_trips(
 # Resources
 #
 #   taxitrips://schema            — the tool surface as JSON (static)
-#   taxitrips://zones             — the TLC zone_id → name lookup (static)
+#   taxitrips://zones             — the TLC zone_id → name lookup (dynamic; re-reads CSV per fetch)
 #   taxitrips://date-range        — earliest/latest pickup dates in the dataset (dynamic)
-#   taxitrips://samples/{tool}    — a live sample of each tool's output (dynamic)
+#   taxitrips://samples/{tool}    — a live sample of each tool's output (dynamic template)
 # ---------------------------------------------------------------------------
 
 
