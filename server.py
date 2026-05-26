@@ -722,6 +722,30 @@ def samples_resource(tool: str) -> str:
     result = sampler()
     return json.dumps(result, indent=2, default=str)
 
+# Prompts
+
+
+@mcp.prompt(
+    name="busiest_zones",
+    description="Rank busiest pickup zones using authoritative zone names.",
+)
+def busiest_zones_prompt(start_date: str, end_date: str, limit: int = 15) -> str:
+    return (
+        f"Rank the {limit} busiest pickup zones between {start_date} and {end_date}.\n\n"
+        f"Steps:\n"
+        f"1. Call the top_pickup_zones tool for the ranking — it returns "
+        f"{{zone_id, trips}}, ordered by trips descending. Pass limit={limit}, "
+        f"start_date={start_date}, and end_date={end_date} (end_date is exclusive, "
+        f"so add a day if you want the final day included).\n"
+        f"2. Read the taxitrips://zones resource and map EACH zone_id to its zone "
+        f"name and borough using THAT resource only.\n\n"
+        f"Do not use the internet or your own knowledge of NYC geography for the "
+        f"names — the taxitrips://zones resource is authoritative, and IDs do not "
+        f"always match what you'd expect. If a zone_id is absent from the resource, "
+        f"label it 'unknown (id N)' rather than guessing.\n\n"
+        f"Return a table with columns: rank, zone, borough, trips."
+    )
+
 
 if __name__ == '__main__':
     mcp.run()
