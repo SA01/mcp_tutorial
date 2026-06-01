@@ -1,6 +1,6 @@
 # Building Production-Grade MCP Servers
 
-Companion repository for the article **[Building Production-Grade MCP Servers](<Add link>)**.
+Companion repository for the article **[Building Production-Grade MCP Servers](https://medium.com/@suffyan.asad1/building-production-grade-mcp-servers-b762a7436927)**.
 
 This repo builds an MCP (Model Context Protocol) server over a PostgreSQL database of NYC Yellow Taxi trips (~48 million rows), and then progressively rebuilds it the way you would for production — moving from a single `run_sql` tool to a layered design with scoped database roles, narrow tools, a validated query builder, resources, and prompts.
 
@@ -73,4 +73,4 @@ This is a teaching repository. The database credentials, open permissions, and c
 
 The full write-up, including the reasoning behind each design decision, the failure modes at each stage, and the production concerns (scaling, authentication, monitoring) is here:
 
-**[Building Production-Grade MCP Servers](<Add link>)**
+**[Building Production-Grade MCP Servers](https://medium.com/@suffyan.asad1/building-production-grade-mcp-servers-b762a7436927)**
